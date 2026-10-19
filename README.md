@@ -11,15 +11,23 @@
   Второй способ заключается в глобализации шаблона на весь Word.
       Скачать готовый шаблон GOST.dotm и вставить его в удобное место. Рекомендую следующий путь: C:\Users\ "NAME" \AppData\Roaming\Microsoft\Word\STARTUP
       Перейти в Параметры Word / Надстройки. 
+      
       <img width="936" height="678" alt="image" src="https://github.com/user-attachments/assets/c30467f4-c5ac-4df1-88e2-092af93bc3cc" />
       Если повезло, то шаблон добавится сразу.
+      
       Если шаблон не добавился, то выбираем Управление: Шаблоны:
+      
       <img width="936" height="678" alt="image" src="https://github.com/user-attachments/assets/ab88c7d1-d62d-4de8-a9f8-3dc13de6ab06" />
+      
       Перейти...
+      
       <img width="515" height="432" alt="image" src="https://github.com/user-attachments/assets/b9427a25-ec58-4351-be18-96c5221ca689" />
+      
       Добавить...
+      
       Указываем путь к шаблону, который был выбран ранее и выбираем GOST.dotm.
 
 В независимости от способа добавления макроса, для его использования необходимо прожать комбинацию alt+F8 и выбрать BuildGOSTDocument:
+
 <img width="487" height="365" alt="image" src="https://github.com/user-attachments/assets/636b0b1e-7a15-4127-bf4a-ca740a596c11" />
 
