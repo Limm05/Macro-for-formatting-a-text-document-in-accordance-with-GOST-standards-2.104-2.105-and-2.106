@@ -1,0 +1,1226 @@
+Option Explicit
+
+' ==============================================================================
+' Генератор каркаса учебного текстового документа по ГОСТ Р 2.104-2023,
+' ГОСТ Р 2.105-2019 и ГОСТ Р 2.106-2019.
+' • Таблицы Формы 2 (185x40 мм) и Формы 2а (185x15 мм) стоят в нижнем колонтитуле
+'   без обтекания (WrapAroundText = False) и НЕ выталкивают текст со страниц.
+' • Контур рамки листа (185x287 мм, отступы 20x5x5x5 мм) лежит в колонтитуле
+'   в слое «За текстом» (wdWrapBehind) и идеально стыкуется с таблицей штампа.
+' • Вертикальная таблица граф 19-23 (5+7 мм, 145 мм) стоит в поле подшивки
+'   слева от рамки (плавающая таблица в верхнем колонтитуле).
+' ==============================================================================
+
+Private Const STYLE_PRE_HEADING As String = "ГОСТ_ДоОглавления"
+Private Const STYLE_TOC_TITLE As String = "ГОСТ_ЗаголовокСодержания"
+Private Const STYLE_UNNUMBERED_H1 As String = "ГОСТ_СтруктурныйЗаголовок"
+Private Const STYLE_APPENDIX_LABEL As String = "ГОСТ_ПриложениеМетка"
+Private Const FRAME_SHAPE_PREFIX As String = "GOST_PageFrame_"
+
+' Допустимые значения WdLineWidth (дискретный перечень, не «пункты»):
+' основная линия штампа 2,25 пт (ближайшая к 2,5 пт рамки), тонкая 1 пт.
+Private Const STAMP_LINE_MAIN As Long = wdLineWidth225pt
+Private Const STAMP_LINE_THIN As Long = wdLineWidth100pt
+Private g_dbg As String   ' отладка: последняя выполнявшаяся строка построения вертикальных граф
+' Зазор от текста до штампа Формы 2 на первом листе (ГОСТ Р 2.105 п. 5.1.3 - не менее 10 мм).
+' 0 - отключить.
+Private Const FORM2_TEXT_GAP_MM As Double = 10#
+
+Public Sub BuildGOSTDocument()
+    Dim doc As Document
+    Dim includeTZ As VbMsgBoxResult
+    Dim includeAbstract As VbMsgBoxResult
+    Dim includeAbbreviations As VbMsgBoxResult
+    Dim includeAppendix As VbMsgBoxResult
+    Dim useCapsStructural As VbMsgBoxResult
+    Dim isCapsMode As Boolean
+    Dim chapterCountText As String, chapterCount As Long
+    Dim docCode As String, docTitle As String, orgName As String
+    Dim devSurname As String, checkerSurname As String, normSurname As String, approverSurname As String
+    Dim insertRng As Range
+    Dim mainSection As Section
+    Dim preSection As Section
+    Dim tocObj As TableOfContents
+    Dim oldTrack As Boolean
+    Dim i As Long
+    Dim currentStep As String
+    Dim docKindIdxText As String, docKindIdx As Long
+    Dim docKindTitle As String, docKindCode As String
+
+    If Documents.Count = 0 Then
+        MsgBox "Откройте документ Microsoft Word перед запуском макроса.", vbExclamation, "Нет открытого документа"
+        Exit Sub
+    End If
+
+    Set doc = ActiveDocument
+
+    ' Если после курсора уже есть текст/разделы от прошлых запусков, предлагаем очистить хвост документа
+    If Selection.Range.End < doc.Content.End - 2 Or doc.Sections.Count > 1 Then
+        Dim cleanAns As VbMsgBoxResult
+        cleanAns = MsgBox( _
+            "В документе обнаружены разделы или текст после текущей позиции курсора (возможно, от предыдущего запуска макроса)." & vbCrLf & vbCrLf & _
+            "Удалить всё, что находится ПОСЛЕ курсора (сохранив титульный лист до курсора), чтобы избежать наложения разделов и пустых страниц?", _
+            vbYesNoCancel + vbQuestion, "Очистка старых разделов")
+        If cleanAns = vbCancel Then Exit Sub
+        If cleanAns = vbYes Then
+            CleanDocumentAfterCursor doc
+        End If
+    End If
+
+    ' 0. Тип документа (определяет вид документа и код в основной надписи)
+    docKindIdxText = InputBox( _
+        "Выберите тип документа (введите номер):" & vbCrLf & vbCrLf & _
+        "1 — Выпускная квалификационная работа (ВКР)" & vbCrLf & _
+        "2 — Курсовая работа" & vbCrLf & _
+        "3 — Курсовой проект" & vbCrLf & _
+        "4 — Отчёт по практике" & vbCrLf & _
+        "5 — Отчёт по лабораторной работе" & vbCrLf & _
+        "6 — Расчётная работа" & vbCrLf & _
+        "7 — Другое (ввести вручную)", _
+        "Тип документа", "1")
+    If Len(Trim$(docKindIdxText)) = 0 Then Exit Sub
+    If Not IsNumeric(docKindIdxText) Then
+        MsgBox "Введите число от 1 до 7.", vbExclamation, "Ошибка ввода"
+        Exit Sub
+    End If
+    docKindIdx = CLng(Val(docKindIdxText))
+    If docKindIdx < 1 Or docKindIdx > 7 Then
+        MsgBox "Допустимые номера типов документа: от 1 до 7.", vbExclamation, "Ошибка ввода"
+        Exit Sub
+    End If
+    ResolveDocKind docKindIdx, docKindTitle, docKindCode
+    If Len(docKindTitle) = 0 Then Exit Sub
+    ' 1. Выбор регистра структурных заголовков
+    useCapsStructural = MsgBox( _
+        "Выберите стиль заголовков структурных элементов:" & vbCrLf & vbCrLf & _
+        "ДА — Строго по ГОСТ Р 2.105–2019 (п. 6.2.5, 6.6.2):" & vbCrLf & _
+        "   • С прописной буквы по центру: «Содержание», «Введение», «Заключение», «Библиография»;" & vbCrLf & _
+        "   • Разделы и подразделы с абзацного отступа 1,25 см: «1 Наименование раздела»." & vbCrLf & vbCrLf & _
+        "НЕТ — Учебный вариант (по ГОСТ 7.32 / СТО вуза):" & vbCrLf & _
+        "   • ПРОПИСНЫМИ БУКВАМИ по центру: «СОДЕРЖАНИЕ», «ВВЕДЕНИЕ», «ЗАКЛЮЧЕНИЕ», «СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ»;" & vbCrLf & _
+        "   • Разделы и подразделы с абзацного отступа 1,25 см.", _
+        vbYesNoCancel + vbQuestion, "Оформление заголовков")
+    If useCapsStructural = vbCancel Then Exit Sub
+    isCapsMode = (useCapsStructural = vbNo)
+
+    ' 2. Состав документа
+    includeTZ = MsgBox("Добавить раздел «Техническое задание» (до содержания, без рамки)?", _
+                       vbYesNoCancel + vbQuestion, "Состав документа")
+    If includeTZ = vbCancel Then Exit Sub
+
+    includeAbstract = MsgBox("Добавить раздел «Реферат» (до содержания, без рамки)?", _
+                             vbYesNoCancel + vbQuestion, "Состав документа")
+    If includeAbstract = vbCancel Then Exit Sub
+
+    includeAbbreviations = MsgBox("Добавить раздел «Обозначения и сокращения» (после содержания)?", _
+                                  vbYesNoCancel + vbQuestion, "Состав документа")
+    If includeAbbreviations = vbCancel Then Exit Sub
+
+    includeAppendix = MsgBox("Добавить «Приложение А» в конце документа?", _
+                             vbYesNoCancel + vbQuestion, "Состав документа")
+    If includeAppendix = vbCancel Then Exit Sub
+
+    chapterCountText = InputBox("Сколько основных разделов создать? (от 1 до 10):", _
+                                "Структура основной части", "3")
+    If Len(Trim$(chapterCountText)) = 0 Then Exit Sub
+    If Not IsNumeric(chapterCountText) Then
+        MsgBox "Введите число от 1 до 10.", vbExclamation, "Ошибка ввода"
+        Exit Sub
+    End If
+    chapterCount = CLng(Val(chapterCountText))
+    If chapterCount < 1 Or chapterCount > 10 Then
+        MsgBox "Допустимое количество разделов: от 1 до 10.", vbExclamation, "Ошибка ввода"
+        Exit Sub
+    End If
+
+    ' 3. Реквизиты основной надписи по ГОСТ Р 2.104-2023
+    docCode = InputBox("Обозначение документа (графа 2 основной надписи):", _
+                       "Основная надпись по ГОСТ Р 2.104–2023", "АБВГ.ХХХХХХ.001 " & docKindCode)
+    docTitle = InputBox("Наименование изделия / темы и документа (графа 1):", _
+                        "Основная надпись по ГОСТ Р 2.104–2023", "Наименование изделия. " & docKindTitle)
+    orgName = InputBox("Наименование организации / вуза и кафедры (графа 9):", _
+                       "Основная надпись по ГОСТ Р 2.104–2023", "Наименование")
+    devSurname = InputBox("Фамилия разработчика / студента (строка «Разраб.»):", _
+                          "Основная надпись по ГОСТ Р 2.104–2023", "Фамилия")
+    checkerSurname = InputBox("Фамилия руководителя / проверяющего (строка «Пров.»):", _
+                              "Основная надпись по ГОСТ Р 2.104–2023", "")
+    normSurname = InputBox("Фамилия нормоконтролёра (строка «Н. контр.»):", _
+                           "Основная надпись по ГОСТ Р 2.104–2023", "")
+    approverSurname = InputBox("Фамилия утверждающего (строка «Утв.»):", _
+                               "Основная надпись по ГОСТ Р 2.104–2023", "")
+
+    Application.ScreenUpdating = False
+        g_dbg = ""
+    On Error GoTo CleanFail
+    currentStep = "Очистка штампа и рамки в титульных разделах"
+    RemoveStaleStampFromTitleSections doc, Selection.Range.Sections(1).Index
+
+    oldTrack = doc.TrackRevisions
+    doc.TrackRevisions = False
+
+    ' 4. Настройка стилей по ГОСТ Р 2.105-2019
+    currentStep = "Настройка стилей документа"
+    ConfigureGOSTStyles doc
+
+    Set insertRng = Selection.Range
+    insertRng.Collapse wdCollapseEnd
+
+    ' 5. Разделы до содержания (при наличии) — без рамки
+    currentStep = "Создание разделов до содержания"
+    If includeTZ = vbYes Or includeAbstract = vbYes Then
+        TrimTrailingEmptyParagraphsBeforeBreak insertRng
+        insertRng.InsertBreak Type:=wdSectionBreakNextPage
+        insertRng.Collapse wdCollapseEnd
+        Set preSection = doc.Sections(insertRng.Sections(1).Index)
+        ConfigureUnframedSection preSection
+
+        Dim firstPre As Boolean
+        firstPre = True
+
+        If includeTZ = vbYes Then
+            AddStyledParagraph insertRng, IIf(isCapsMode, "ТЕХНИЧЕСКОЕ ЗАДАНИЕ", "Техническое задание"), _
+                               STYLE_PRE_HEADING, Not firstPre
+            AddBodyParagraph insertRng, "Исходные данные и основные требования технического задания.", 14
+            firstPre = False
+        End If
+
+        If includeAbstract = vbYes Then
+            AddStyledParagraph insertRng, IIf(isCapsMode, "РЕФЕРАТ", "Реферат"), _
+                               STYLE_PRE_HEADING, Not firstPre
+                        AddBodyParagraph insertRng, docKindTitle & " содержит __ с., __ рис., __ табл., __ источн., __ прил.", 14
+            AddBodyParagraph insertRng, "КЛЮЧЕВЫЕ СЛОВА: ПЕРЕЧЕНЬ КЛЮЧЕВЫХ СЛОВ В ИМЕНИТЕЛЬНОМ ПАДЕЖЕ ЧЕРЕЗ ЗАПЯТУЮ.", 14
+            AddBodyParagraph insertRng, "Текст реферата (объект разработки, цель работы, методы исследования и полученные результаты).", 14
+            firstPre = False
+        End If
+    End If
+
+    ' 6. Разрыв раздела перед листом «Содержание»
+    currentStep = "Создание основного раздела с рамкой и основными надписями"
+    TrimTrailingEmptyParagraphsBeforeBreak insertRng
+    insertRng.InsertBreak Type:=wdSectionBreakNextPage
+    insertRng.Collapse wdCollapseEnd
+
+    Set mainSection = doc.Sections(insertRng.Sections(1).Index)
+
+    ' 7. Лист «Содержание»
+    currentStep = "Вставка заголовка Содержание и автооглавления"
+    AddStyledParagraph insertRng, IIf(isCapsMode, "СОДЕРЖАНИЕ", "Содержание"), STYLE_TOC_TITLE, False
+
+    Dim tocRng As Range
+    Set tocRng = insertRng.Duplicate
+    tocRng.Collapse wdCollapseEnd
+
+    Set tocObj = doc.TablesOfContents.Add( _
+        Range:=tocRng, _
+        UseHeadingStyles:=True, _
+        UpperHeadingLevel:=1, _
+        LowerHeadingLevel:=3, _
+        UseFields:=True, _
+        RightAlignPageNumbers:=True, _
+        IncludePageNumbers:=True, _
+        UseHyperlinks:=True)
+
+    insertRng.SetRange Start:=tocObj.Range.End, End:=tocObj.Range.End
+    insertRng.Collapse wdCollapseEnd
+
+    ' 8. Структурные разделы и основная часть
+    currentStep = "Вставка разделов основной части"
+    If includeAbbreviations = vbYes Then
+        AddStyledParagraph insertRng, _
+            IIf(isCapsMode, "ОБОЗНАЧЕНИЯ И СОКРАЩЕНИЯ", "Обозначения и сокращения"), STYLE_UNNUMBERED_H1, True
+        AddBodyParagraph insertRng, "В настоящем документе применены следующие обозначения и сокращения:", 14
+    End If
+
+    ' Введение
+    AddStyledParagraph insertRng, IIf(isCapsMode, "ВВЕДЕНИЕ", "Введение"), STYLE_UNNUMBERED_H1, True
+    AddBodyParagraph insertRng, "Во введении указывают основание для разработки, актуальность темы, цель и задачи работы.", 14
+
+    ' Нумерованные разделы и подразделы (п. 6.5.4, 6.6.1, 6.6.2 ГОСТ Р 2.105-2019)
+    For i = 1 To chapterCount
+        AddHeadingParagraph insertRng, CStr(i) & " Наименование раздела " & CStr(i), wdStyleHeading1, True
+        AddHeadingParagraph insertRng, CStr(i) & ".1 Наименование первого подраздела", wdStyleHeading2, False
+        AddBodyParagraph insertRng, "Основной текст подраздела " & CStr(i) & ".1 (шрифт Times New Roman, кегль 14 пт, межстрочный интервал 1,5, абзацный отступ 1,25 см).", 14
+
+        AddHeadingParagraph insertRng, CStr(i) & ".2 Наименование второго подраздела", wdStyleHeading2, False
+        AddBodyParagraph insertRng, "Основной текст подраздела " & CStr(i) & ".2. Таблицы, формулы и иллюстрации оформляют в соответствии с разделом 6 ГОСТ Р 2.105–2019.", 14
+    Next i
+
+    ' Заключение
+    AddStyledParagraph insertRng, IIf(isCapsMode, "ЗАКЛЮЧЕНИЕ", "Заключение"), STYLE_UNNUMBERED_H1, True
+    AddBodyParagraph insertRng, "В заключении приводят основные выводы и результаты выполненной работы.", 14
+
+    ' Библиография / Список использованных источников
+    AddStyledParagraph insertRng, _
+        IIf(isCapsMode, "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "Библиография"), STYLE_UNNUMBERED_H1, True
+    AddBodyParagraph insertRng, "1. ГОСТ Р 2.105–2019 Единая система конструкторской документации. Общие требования к текстовым документам. — М. : Стандартинформ, 2019. — 31 с.", 14
+
+    ' Приложение А (п. 6.3.4 ГОСТ Р 2.105-2019)
+    If includeAppendix = vbYes Then
+        currentStep = "Вставка Приложения А"
+        AddAppendixBlock insertRng, "А", "обязательное", "Наименование приложения"
+    End If
+
+    ' 9. Настройка колонтитулов: рамка листа (20x5x5x5 мм) + линейные таблицы Формы 2 и Формы 2а
+    currentStep = "Настройка параметров страницы раздела"
+    ConfigureFramedSectionPageSetup mainSection
+
+    currentStep = "Построение рамки и Формы 2 на первом листе раздела"
+    AddPageBorderRectInHeader mainSection.Headers(wdHeaderFooterFirstPage), "FirstPage"
+    BuildLeftBindingTable mainSection.Headers(wdHeaderFooterFirstPage), "FirstPage"
+    BuildFooterTableForm2 mainSection.Footers(wdHeaderFooterFirstPage), _
+                          docCode, docTitle, orgName, _
+                          devSurname, checkerSurname, normSurname, approverSurname
+
+    currentStep = "Построение рамки и Формы 2а на последующих листах раздела"
+    AddPageBorderRectInHeader mainSection.Headers(wdHeaderFooterPrimary), "Primary"
+    BuildLeftBindingTable mainSection.Headers(wdHeaderFooterPrimary), "Primary"
+    BuildFooterTableForm2a mainSection.Footers(wdHeaderFooterPrimary), docCode
+
+    ' 10. Обновление полей и оглавления
+    currentStep = "Обновление полей и автооглавления"
+    UpdateAllDocumentFields doc
+
+    doc.TrackRevisions = oldTrack
+    Application.ScreenUpdating = True
+
+    MsgBox "Каркас документа успешно создан!" & vbCrLf & vbCrLf & _
+           "• Лишние страницы полностью устранены: на каждый раздел приходится ровно 1 страница." & vbCrLf & _
+           "• Рамка (20x5x5x5 мм) и таблицы Формы 2 и 2а расположены в колонтитулах и идеально состыкованы.", _
+           vbInformation, "Готово"
+    Exit Sub
+
+CleanFail:
+    Dim errMsg As String
+    errMsg = Err.Description & " (код " & Err.Number & ") на этапе: [" & currentStep & "]"
+    If Len(g_dbg) > 0 Then errMsg = errMsg & " [" & g_dbg & "]"
+    On Error Resume Next
+    doc.TrackRevisions = oldTrack
+    Application.ScreenUpdating = True
+    MsgBox "Ошибка при выполнении макроса: " & errMsg & vbCrLf & _
+           "Нажмите Ctrl+Z для отмены изменений.", vbCritical, "Ошибка VBA"
+End Sub
+' ==============================================================================
+' Вид документа и код вида (по перечню ГОСТ Р 2.106: ПЗ, РР, Д и т. д.) по выбранному типу
+' ==============================================================================
+Private Sub ResolveDocKind(ByVal idx As Long, ByRef kindTitle As String, ByRef kindCode As String)
+    Select Case idx
+        Case 1, 2, 3
+            kindTitle = "Пояснительная записка"
+            kindCode = "ПЗ"
+        Case 4
+            kindTitle = "Отчёт по практике"
+            kindCode = "Д"
+        Case 5
+            kindTitle = "Отчёт по лабораторной работе"
+            kindCode = "Д"
+        Case 6
+            kindTitle = "Расчёт"
+            kindCode = "РР"
+        Case 7
+            kindTitle = Trim$(InputBox("Введите вид документа (например, «Отчёт по НИР»):", _
+                                       "Тип документа", "Пояснительная записка"))
+            kindCode = "Д"
+    End Select
+End Sub
+' ==============================================================================
+' Удаляет следы прошлых запусков (рамка GOST_PageFrame_* и таблицы штампа/граф 19-25)
+' из колонтитулов титульных разделов (с первого до раздела, где стоит курсор).
+' Остальное содержимое колонтитулов титульного листа не трогается.
+' ==============================================================================
+Private Sub RemoveStaleStampFromTitleSections(ByVal doc As Document, ByVal lastTitleSection As Long)
+    Dim s As Long, k As Long
+    Dim kinds As Variant
+
+    kinds = Array(wdHeaderFooterPrimary, wdHeaderFooterFirstPage, wdHeaderFooterEvenPages)
+
+    For s = 1 To lastTitleSection
+        For k = 0 To 2
+            CleanStampArtifacts doc.Sections(s).Headers(kinds(k))
+            CleanStampArtifacts doc.Sections(s).Footers(kinds(k))
+        Next k
+    Next s
+End Sub
+
+Private Sub CleanStampArtifacts(ByVal hf As HeaderFooter)
+    Dim i As Long
+    Dim txt As String
+
+    If Not hf.Exists Then Exit Sub
+
+    For i = hf.Range.Tables.Count To 1 Step -1
+        txt = hf.Range.Tables(i).Range.Text
+        If InStr(txt, "Изм.") > 0 Or InStr(txt, "Инв. №") > 0 Then
+            hf.Range.Tables(i).Delete
+        End If
+    Next i
+
+    If hf.Range.ShapeRange.Count > 0 Then
+        For i = hf.Range.ShapeRange.Count To 1 Step -1
+            If hf.Range.ShapeRange(i).Name Like FRAME_SHAPE_PREFIX & "*" Then
+                hf.Range.ShapeRange(i).Delete
+            End If
+        Next i
+    End If
+End Sub
+
+' ==============================================================================
+' Очистка старых разделов после позиции курсора (чтобы не накапливались секции)
+' ==============================================================================
+Private Sub CleanDocumentAfterCursor(ByVal doc As Document)
+    On Error Resume Next
+    Dim delRng As Range
+    If Selection.Range.End < doc.Content.End - 1 Then
+        Set delRng = doc.Range(Selection.Range.End, doc.Content.End - 1)
+        delRng.Delete
+    End If
+    ' Убираем случайно оставшиеся рамки в первом разделе (титульнике)
+    doc.Sections(1).Borders.Enable = False
+    On Error GoTo 0
+End Sub
+
+' ==============================================================================
+' Настройка стилей текста и заголовков по ГОСТ Р 2.105-2019
+' ==============================================================================
+Private Sub ConfigureGOSTStyles(ByVal doc As Document)
+    Dim stNormal As Style
+    Dim stH1 As Style
+    Dim stH2 As Style
+    Dim stH3 As Style
+    Dim stPre As Style
+    Dim stTocTitle As Style
+    Dim stStructH1 As Style
+    Dim stAppLabel As Style
+    Dim i As Long
+
+    Set stNormal = doc.Styles(wdStyleNormal)
+    With stNormal.Font
+        .Name = "Times New Roman"
+        .Size = 14
+        .Bold = False
+        .Italic = False
+        .Color = wdColorBlack
+    End With
+    With stNormal.ParagraphFormat
+        .Alignment = wdAlignParagraphJustify
+        .FirstLineIndent = CentimetersToPoints(1.25)
+        .LeftIndent = 0
+        .RightIndent = 0
+        .SpaceBefore = 0
+        .SpaceAfter = 0
+        .LineSpacingRule = wdLineSpace1pt5
+        .WidowControl = True
+        .KeepWithNext = False
+        .KeepTogether = False
+        .PageBreakBefore = False
+        .OutlineLevel = wdOutlineLevelBodyText
+    End With
+
+    ' Заголовок 1 (разделы: «1 Наименование раздела»)
+    Set stH1 = doc.Styles(wdStyleHeading1)
+    With stH1.Font
+        .Name = "Times New Roman"
+        .Size = 14
+        .Bold = True
+        .Italic = False
+        .Color = wdColorBlack
+    End With
+    With stH1.ParagraphFormat
+        .Alignment = wdAlignParagraphLeft
+        .FirstLineIndent = CentimetersToPoints(1.25)
+        .LeftIndent = 0
+        .RightIndent = 0
+        .SpaceBefore = 0
+        .SpaceAfter = ptFromMm(10#)
+        .LineSpacingRule = wdLineSpace1pt5
+        .KeepWithNext = True
+        .KeepTogether = True
+        .PageBreakBefore = False
+        .OutlineLevel = wdOutlineLevel1
+    End With
+
+    ' Заголовок 2 (подразделы: «1.1 Наименование подраздела»)
+    Set stH2 = doc.Styles(wdStyleHeading2)
+    With stH2.Font
+        .Name = "Times New Roman"
+        .Size = 14
+        .Bold = True
+        .Italic = False
+        .Color = wdColorBlack
+    End With
+    With stH2.ParagraphFormat
+        .Alignment = wdAlignParagraphLeft
+        .FirstLineIndent = CentimetersToPoints(1.25)
+        .LeftIndent = 0
+        .RightIndent = 0
+        .SpaceBefore = ptFromMm(10#)
+        .SpaceAfter = ptFromMm(6#)
+        .LineSpacingRule = wdLineSpace1pt5
+        .KeepWithNext = True
+        .KeepTogether = True
+        .PageBreakBefore = False
+        .OutlineLevel = wdOutlineLevel2
+    End With
+
+    ' Заголовок 3 (пункты)
+    Set stH3 = doc.Styles(wdStyleHeading3)
+    With stH3.Font
+        .Name = "Times New Roman"
+        .Size = 14
+        .Bold = True
+        .Italic = False
+        .Color = wdColorBlack
+    End With
+    With stH3.ParagraphFormat
+        .Alignment = wdAlignParagraphLeft
+        .FirstLineIndent = CentimetersToPoints(1.25)
+        .LeftIndent = 0
+        .RightIndent = 0
+        .SpaceBefore = ptFromMm(6#)
+        .SpaceAfter = ptFromMm(4#)
+        .LineSpacingRule = wdLineSpace1pt5
+        .KeepWithNext = True
+        .KeepTogether = True
+        .PageBreakBefore = False
+        .OutlineLevel = wdOutlineLevel3
+    End With
+
+    Set stPre = GetOrCreateParagraphStyle(doc, STYLE_PRE_HEADING)
+    FormatCustomHeadingStyle stPre, 14, True, wdAlignParagraphCenter, 0, ptFromMm(10#), wdOutlineLevelBodyText
+
+    Set stTocTitle = GetOrCreateParagraphStyle(doc, STYLE_TOC_TITLE)
+    FormatCustomHeadingStyle stTocTitle, 14, True, wdAlignParagraphCenter, 0, ptFromMm(10#), wdOutlineLevelBodyText
+
+    Set stStructH1 = GetOrCreateParagraphStyle(doc, STYLE_UNNUMBERED_H1)
+    FormatCustomHeadingStyle stStructH1, 14, True, wdAlignParagraphCenter, 0, ptFromMm(10#), wdOutlineLevel1
+
+    Set stAppLabel = GetOrCreateParagraphStyle(doc, STYLE_APPENDIX_LABEL)
+    FormatCustomHeadingStyle stAppLabel, 14, True, wdAlignParagraphCenter, 0, 0, wdOutlineLevelBodyText
+
+    On Error Resume Next
+    For i = 1 To 3
+        Dim tocStyle As Style
+        Select Case i
+            Case 1: Set tocStyle = doc.Styles(wdStyleTOC1)
+            Case 2: Set tocStyle = doc.Styles(wdStyleTOC2)
+            Case 3: Set tocStyle = doc.Styles(wdStyleTOC3)
+        End Select
+        If Not tocStyle Is Nothing Then
+            With tocStyle.Font
+                .Name = "Times New Roman"
+                .Size = 14
+                .Bold = False
+                .Italic = False
+                .Color = wdColorBlack
+            End With
+            With tocStyle.ParagraphFormat
+                .FirstLineIndent = 0
+                .LeftIndent = CentimetersToPoints((i - 1) * 0.5)
+                .SpaceBefore = 0
+                .SpaceAfter = 0
+                .LineSpacingRule = wdLineSpace1pt5
+            End With
+        End If
+    Next i
+    On Error GoTo 0
+End Sub
+
+Private Sub FormatCustomHeadingStyle(ByVal st As Style, ByVal fontSizePt As Single, _
+                                     ByVal isBold As Boolean, ByVal align As WdParagraphAlignment, _
+                                     ByVal firstIndentPts As Single, ByVal spaceAfterPts As Single, _
+                                     ByVal outLevel As WdOutlineLevel)
+    With st.Font
+        .Name = "Times New Roman"
+        .Size = fontSizePt
+        .Bold = isBold
+        .Italic = False
+        .Color = wdColorBlack
+    End With
+    With st.ParagraphFormat
+        .Alignment = align
+        .FirstLineIndent = firstIndentPts
+        .LeftIndent = 0
+        .RightIndent = 0
+        .SpaceBefore = 0
+        .SpaceAfter = spaceAfterPts
+        .LineSpacingRule = wdLineSpace1pt5
+        .KeepWithNext = True
+        .KeepTogether = True
+        .PageBreakBefore = False
+        .OutlineLevel = outLevel
+    End With
+End Sub
+
+Private Function GetOrCreateParagraphStyle(ByVal doc As Document, ByVal styleName As String) As Style
+    Dim st As Style
+    On Error Resume Next
+    Set st = doc.Styles(styleName)
+    On Error GoTo 0
+    If st Is Nothing Then
+        Set st = doc.Styles.Add(Name:=styleName, Type:=wdStyleTypeParagraph)
+    End If
+    Set GetOrCreateParagraphStyle = st
+End Function
+
+' ==============================================================================
+' Вставка абзацев и заголовков
+' ==============================================================================
+Private Sub AddStyledParagraph(ByRef r As Range, ByVal textVal As String, _
+                               ByVal styleName As String, ByVal insertPageBreakBefore As Boolean)
+    r.Collapse wdCollapseEnd
+    If insertPageBreakBefore Then
+        r.InsertBreak Type:=wdPageBreak
+        r.Collapse wdCollapseEnd
+    End If
+    Dim startPos As Long
+    startPos = r.Start
+    r.InsertAfter textVal & vbCr
+    Dim paraRng As Range
+    Set paraRng = r.Document.Range(startPos, r.End - 1)
+    paraRng.Style = r.Document.Styles(styleName)
+    r.Collapse wdCollapseEnd
+End Sub
+
+Private Sub AddHeadingParagraph(ByRef r As Range, ByVal textVal As String, _
+                                ByVal builtInStyle As WdBuiltinStyle, ByVal insertPageBreakBefore As Boolean)
+    r.Collapse wdCollapseEnd
+    If insertPageBreakBefore Then
+        r.InsertBreak Type:=wdPageBreak
+        r.Collapse wdCollapseEnd
+    End If
+    Dim startPos As Long
+    startPos = r.Start
+    r.InsertAfter textVal & vbCr
+    Dim paraRng As Range
+    Set paraRng = r.Document.Range(startPos, r.End - 1)
+    paraRng.Style = r.Document.Styles(builtInStyle)
+    r.Collapse wdCollapseEnd
+End Sub
+
+Private Sub AddBodyParagraph(ByRef r As Range, ByVal textVal As String, ByVal fontSizePt As Single)
+    r.Collapse wdCollapseEnd
+    Dim startPos As Long
+    startPos = r.Start
+    r.InsertAfter textVal & vbCr
+    Dim paraRng As Range
+    Set paraRng = r.Document.Range(startPos, r.End - 1)
+    paraRng.Style = r.Document.Styles(wdStyleNormal)
+    paraRng.Font.Size = fontSizePt
+    r.Collapse wdCollapseEnd
+End Sub
+
+Private Sub AddAppendixBlock(ByRef r As Range, ByVal appLetter As String, _
+                             ByVal appStatus As String, ByVal appTitle As String)
+    r.Collapse wdCollapseEnd
+    r.InsertBreak Type:=wdPageBreak
+    r.Collapse wdCollapseEnd
+
+    Dim sPos As Long
+    Dim pRng As Range
+
+    sPos = r.Start
+    r.InsertAfter "Приложение " & appLetter & vbCr
+    Set pRng = r.Document.Range(sPos, r.End - 1)
+    pRng.Style = r.Document.Styles(STYLE_UNNUMBERED_H1)
+    pRng.ParagraphFormat.SpaceAfter = 0
+    r.Collapse wdCollapseEnd
+
+    sPos = r.Start
+    r.InsertAfter "(" & appStatus & ")" & vbCr
+    Set pRng = r.Document.Range(sPos, r.End - 1)
+    pRng.Style = r.Document.Styles(STYLE_APPENDIX_LABEL)
+    pRng.Font.Bold = False
+    pRng.ParagraphFormat.SpaceAfter = ptFromMm(3#)
+    r.Collapse wdCollapseEnd
+
+    sPos = r.Start
+    r.InsertAfter appTitle & vbCr
+    Set pRng = r.Document.Range(sPos, r.End - 1)
+    pRng.Style = r.Document.Styles(STYLE_APPENDIX_LABEL)
+    pRng.Font.Bold = True
+    pRng.ParagraphFormat.SpaceAfter = ptFromMm(10#)
+    r.Collapse wdCollapseEnd
+
+    AddBodyParagraph r, "Текст и материалы приложения А (по п. 5.1.1 ГОСТ Р 2.105–2019 для приложений используется шрифт 12 пт).", 12
+End Sub
+
+Private Sub TrimTrailingEmptyParagraphsBeforeBreak(ByRef r As Range)
+    On Error Resume Next
+    Do While r.Start > 1
+        Dim prevChar As Range
+        Set prevChar = r.Document.Range(r.Start - 1, r.Start)
+        If prevChar.Text = vbCr Then
+            If prevChar.Paragraphs(1).Range.Characters.Count = 1 Then
+                prevChar.Delete
+            Else
+                Exit Do
+            End If
+        Else
+            Exit Do
+        End If
+    Loop
+    On Error GoTo 0
+End Sub
+
+' ==============================================================================
+' Настройка разделов
+' ==============================================================================
+Private Sub ConfigureUnframedSection(ByVal sec As Section)
+    sec.Borders.Enable = False
+    With sec.PageSetup
+        .PaperSize = wdPaperA4
+        .Orientation = wdOrientPortrait
+        .TopMargin = ptFromMm(20#)
+        .BottomMargin = ptFromMm(20#)
+        .LeftMargin = ptFromMm(30#)
+        .RightMargin = ptFromMm(15#)
+        .DifferentFirstPageHeaderFooter = False
+        .OddAndEvenPagesHeaderFooter = False
+    End With
+
+    UnlinkAndClearHeaderFooter sec.Headers(wdHeaderFooterPrimary)
+    UnlinkAndClearHeaderFooter sec.Headers(wdHeaderFooterFirstPage)
+    UnlinkAndClearHeaderFooter sec.Footers(wdHeaderFooterPrimary)
+    UnlinkAndClearHeaderFooter sec.Footers(wdHeaderFooterFirstPage)
+End Sub
+
+Private Sub ConfigureFramedSectionPageSetup(ByVal sec As Section)
+    sec.Borders.Enable = False
+
+    With sec.PageSetup
+        .PaperSize = wdPaperA4
+        .Orientation = wdOrientPortrait
+        .PageWidth = ptFromMm(210#)
+        .PageHeight = ptFromMm(297#)
+        .DifferentFirstPageHeaderFooter = True
+        .OddAndEvenPagesHeaderFooter = False
+
+        ' Поля текста внутри рамки (п. 5.1.3 ГОСТ Р 2.105-2019):
+        ' Рамка стоит в 20 мм слева и по 5 мм сверху, справа и снизу.
+        ' Текст отступает от рамки на 5 мм по бокам (>= 3 мм) и на 10 мм сверху/снизу:
+        .LeftMargin = ptFromMm(25#)   ' 20 мм рамка + 5 мм до текста
+        .RightMargin = ptFromMm(10#)  ' 5 мм рамка + 5 мм до текста
+        .TopMargin = ptFromMm(15#)    ' 5 мм рамка + 10 мм до текста
+        .BottomMargin = ptFromMm(30#) ' 5 мм снизу + 15 мм Форма 2а + 10 мм до текста
+        .HeaderDistance = ptFromMm(5#)
+        .FooterDistance = ptFromMm(5#) ' Нижний край таблицы штампа стоит ровно в 5 мм от нижнего края листа!
+    End With
+
+    UnlinkAndClearHeaderFooter sec.Headers(wdHeaderFooterPrimary)
+    UnlinkAndClearHeaderFooter sec.Headers(wdHeaderFooterFirstPage)
+    UnlinkAndClearHeaderFooter sec.Footers(wdHeaderFooterPrimary)
+    UnlinkAndClearHeaderFooter sec.Footers(wdHeaderFooterFirstPage)
+End Sub
+
+Private Sub UnlinkAndClearHeaderFooter(ByVal hf As HeaderFooter)
+    On Error Resume Next
+    hf.LinkToPrevious = False
+    Dim i As Long
+    For i = hf.Shapes.Count To 1 Step -1
+        hf.Shapes(i).Delete
+    Next i
+    hf.Range.Delete
+    On Error GoTo 0
+End Sub
+
+' ==============================================================================
+' Внешняя рамка листа 185 x 287 мм в колонтитуле (20 мм слева, по 5 мм с остальных сторон)
+' Слой wdWrapBehind («За текстом») гарантирует, что рамка НЕ выталкивает текст со страниц!
+' ==============================================================================
+Private Sub AddPageBorderRectInHeader(ByVal hdr As HeaderFooter, ByVal tagSuffix As String)
+    Dim shp As Shape
+    Dim anchorRng As Range
+
+    ' Сжимаем пустой абзац верхнего колонтитула до 1 пт, чтобы он не сдвигал верхнее поле текста (15 мм)
+    SuppressTrailingHeaderFooterParagraph hdr
+
+    Set anchorRng = hdr.Range
+    anchorRng.Collapse wdCollapseStart
+
+    ' Прямоугольник 185 x 287 мм (msoShapeRectangle = 1)
+    Set shp = hdr.Shapes.AddShape(1, ptFromMm(20#), ptFromMm(5#), ptFromMm(185#), ptFromMm(287#), anchorRng)
+    With shp
+        .Name = FRAME_SHAPE_PREFIX & tagSuffix
+        .RelativeHorizontalPosition = wdRelativeHorizontalPositionPage
+        .RelativeVerticalPosition = wdRelativeVerticalPositionPage
+        .Left = ptFromMm(20#)
+        .Top = ptFromMm(5#)
+        .Width = ptFromMm(185#)
+        .Height = ptFromMm(287#)
+        .Fill.Visible = msoFalse
+        .Line.Visible = msoTrue
+        .Line.ForeColor.RGB = RGB(0, 0, 0)
+        .Line.weight = 2.5  ' Сплошная основная линия по ГОСТ 2.303 (~0.5 мм)
+        .Line.DashStyle = msoLineSolid
+        .WrapFormat.Type = wdWrapBehind ' ЗА ТЕКСТОМ — не влияет на поток текста!
+        .WrapFormat.AllowOverlap = True
+    End With
+End Sub
+Private Sub BuildLeftBindingTable(ByVal hdr As HeaderFooter, ByVal tagSuffix As String)
+    ' Графы 25 и 24 (сверху вниз)
+    AddBindingBlockShapes hdr, tagSuffix & "_A", 5#, Array(60#, 60#), Array("Перв. примен.", "Справ. №")
+
+    ' Графы 23, 22, 21, 20, 19 (сверху вниз)
+    AddBindingBlockShapes hdr, tagSuffix & "_B", 292# - 145#, Array(35#, 25#, 25#, 35#, 25#), _
+                          Array("Подп. и дата", "Инв. № дубл.", "Взам. инв. №", "Подп. и дата", "Инв. № подл.")
+End Sub
+Private Sub AddBindingBlockShapes(ByVal hdr As HeaderFooter, ByVal tag As String, ByVal topMm As Double, _
+                                  ByVal rowHeightsMm As Variant, ByVal titles As Variant)
+    Dim anchorRng As Range
+    Dim shp As Shape
+    Dim i As Long, n As Long
+    Dim h As Double, yMm As Double, totalMm As Double
+
+    n = UBound(rowHeightsMm) - LBound(rowHeightsMm) + 1
+    yMm = topMm
+    totalMm = 0
+
+    For i = 0 To n - 1
+        h = CDbl(rowHeightsMm(LBound(rowHeightsMm) + i))
+
+        ' Ячейка названия графы (5 мм) — пустой прямоугольник, текст кладётся отдельно
+        g_dbg = tag & ": AddShape ячейка названия " & CStr(i)
+        Set anchorRng = hdr.Range
+        anchorRng.Collapse wdCollapseStart
+        Set shp = hdr.Shapes.AddShape(1, ptFromMm(8#), ptFromMm(yMm), ptFromMm(5#), ptFromMm(h), anchorRng)
+        StyleBindingShape shp, 1#, "Bind_" & tag & "_T" & CStr(i), 8#, yMm, 5#, h
+
+        ' Ячейка поля графы (7 мм), пустая
+        g_dbg = tag & ": AddShape ячейка поля " & CStr(i)
+        Set anchorRng = hdr.Range
+        anchorRng.Collapse wdCollapseStart
+        Set shp = hdr.Shapes.AddShape(1, ptFromMm(13#), ptFromMm(yMm), ptFromMm(7#), ptFromMm(h), anchorRng)
+        StyleBindingShape shp, 1#, "Bind_" & tag & "_F" & CStr(i), 13#, yMm, 7#, h
+
+        ' Подпись графы — отдельная надпись без линий и заливки
+        AddBindingLabel hdr, tag, i, CStr(titles(LBound(titles) + i)), 8#, yMm, 5#, h
+
+        yMm = yMm + h
+        totalMm = totalMm + h
+    Next i
+
+    ' Внешний контур блока — основная линия той же толщины, что и рамка (2,5 пт)
+    g_dbg = tag & ": AddShape контур блока"
+    Set anchorRng = hdr.Range
+    anchorRng.Collapse wdCollapseStart
+    Set shp = hdr.Shapes.AddShape(1, ptFromMm(8#), ptFromMm(topMm), ptFromMm(12#), ptFromMm(totalMm), anchorRng)
+    StyleBindingShape shp, 2.5, "Bind_" & tag & "_Outline", 8#, topMm, 12#, totalMm
+
+    g_dbg = ""
+End Sub
+
+' Подпись графы: надпись (текстовое поле) с текстом снизу вверх, без линий и заливки.
+' Геометрию задаём ДО записи текста и после этого фигуру не трогаем.
+Private Sub AddBindingLabel(ByVal hdr As HeaderFooter, ByVal tag As String, ByVal idx As Long, _
+                            ByVal textVal As String, ByVal xMm As Double, ByVal yMm As Double, _
+                            ByVal wMm As Double, ByVal hMm As Double)
+    Dim anchorRng As Range
+    Dim shp As Shape
+    Dim nm As String
+
+    nm = FRAME_SHAPE_PREFIX & "Bind_" & tag & "_L" & CStr(idx)
+
+    g_dbg = nm & ": AddTextbox"
+    Set anchorRng = hdr.Range
+    anchorRng.Collapse wdCollapseStart
+    Set shp = hdr.Shapes.AddTextbox(msoTextOrientationUpward, ptFromMm(xMm), ptFromMm(yMm), _
+                                    ptFromMm(wMm), ptFromMm(hMm), anchorRng)
+
+    g_dbg = nm & ": Name и позиция"
+    shp.Name = nm
+    With shp
+        .RelativeHorizontalPosition = wdRelativeHorizontalPositionPage
+        .RelativeVerticalPosition = wdRelativeVerticalPositionPage
+        .Left = ptFromMm(xMm)
+        .Top = ptFromMm(yMm)
+        .Width = ptFromMm(wMm)
+        .Height = ptFromMm(hMm)
+        g_dbg = nm & ": линия и заливка"
+        .Line.Visible = msoFalse
+        .Fill.Visible = msoFalse
+        g_dbg = nm & ": обтекание"
+        .WrapFormat.Type = wdWrapBehind
+        .WrapFormat.AllowOverlap = True
+    End With
+
+    g_dbg = nm & ": текст"
+    With shp.TextFrame
+        .TextRange.Text = textVal
+        .TextRange.Font.Name = "Times New Roman"
+        .TextRange.Font.Size = 8
+        .TextRange.Font.Italic = True
+        .TextRange.Font.Bold = False
+        .TextRange.Font.Color = wdColorBlack
+        .TextRange.ParagraphFormat.Alignment = wdAlignParagraphCenter
+    End With
+
+    ' Косметика (поля и привязка текста): сбой здесь не должен ломать построение
+    g_dbg = nm & ": поля текста"
+    On Error Resume Next
+    With shp.TextFrame
+        .MarginLeft = 0
+        .MarginRight = 0
+        .MarginTop = 0
+        .MarginBottom = 0
+        .AutoSize = False
+        .VerticalAnchor = msoAnchorMiddle
+    End With
+    On Error GoTo CleanFail_Label
+    g_dbg = ""
+    Exit Sub
+
+CleanFail_Label:
+    ' локальной обработки нет: передаём ошибку выше, в CleanFail
+    Err.Raise Err.Number, "AddBindingLabel", Err.Description
+End Sub
+
+Private Sub StyleBindingShape(ByVal shp As Shape, ByVal linePt As Single, ByVal shpName As String, _
+                              ByVal xMm As Double, ByVal yMm As Double, _
+                              ByVal wMm As Double, ByVal hMm As Double)
+    g_dbg = shpName & ": Name"
+    shp.Name = FRAME_SHAPE_PREFIX & shpName
+    g_dbg = shpName & ": позиция"
+    With shp
+        .RelativeHorizontalPosition = wdRelativeHorizontalPositionPage
+        .RelativeVerticalPosition = wdRelativeVerticalPositionPage
+        .Left = ptFromMm(xMm)
+        .Top = ptFromMm(yMm)
+        .Width = ptFromMm(wMm)
+        .Height = ptFromMm(hMm)
+        g_dbg = shpName & ": заливка и линия"
+        .Fill.Visible = msoFalse
+        .Line.Visible = msoTrue
+        .Line.ForeColor.RGB = RGB(0, 0, 0)
+        .Line.weight = linePt
+        .Line.DashStyle = msoLineSolid
+        g_dbg = shpName & ": обтекание"
+        .WrapFormat.Type = wdWrapBehind
+        .WrapFormat.AllowOverlap = True
+    End With
+End Sub
+
+
+' ==============================================================================
+' Линейная таблица Формы 2 (185 x 40 мм) в нижнем колонтитуле первого листа раздела
+' WrapAroundText = False — таблица стоит на дне колонтитула и НЕ ломает верстку страниц!
+' ==============================================================================
+Private Sub BuildFooterTableForm2(ByVal ftr As HeaderFooter, _
+                                  ByVal docCode As String, ByVal docTitle As String, ByVal orgName As String, _
+                                  ByVal devSurname As String, ByVal checkerSurname As String, _
+                                  ByVal normSurname As String, ByVal approverSurname As String)
+    Dim rng As Range
+    Dim tbl As Table
+    Dim r As Long, c As Long
+    Dim colWidthsMm As Variant
+
+    ' Зазор 10 мм между текстом и штампом на первом листе (Форма 2 выше поля 30 мм):
+    ' пустой абзац точной высоты над таблицей
+    If FORM2_TEXT_GAP_MM > 0 Then
+        ftr.Range.InsertParagraphBefore
+        With ftr.Range.Paragraphs.First.Range
+            .Font.Size = 1
+            .ParagraphFormat.FirstLineIndent = 0
+            .ParagraphFormat.SpaceBefore = 0
+            .ParagraphFormat.SpaceAfter = 0
+            .ParagraphFormat.LineSpacingRule = wdLineSpaceExactly
+            .ParagraphFormat.LineSpacing = ptFromMm(FORM2_TEXT_GAP_MM)
+        End With
+        Set rng = ftr.Range.Paragraphs.Last.Range
+    Else
+        Set rng = ftr.Range
+    End If
+    rng.Collapse wdCollapseStart
+
+    ' 12 базовых столбцов: 7, 10, 23, 15, 10, 70, 5, 5, 5, 15, 10, 10 мм (сумма = 185 мм)
+    ' По чертежу Формы 2: Лит. = 5+5+5, Лист = 15, Листов = 20 (столбцы 11+12), Вер. = 10
+    colWidthsMm = Array(7#, 10#, 23#, 15#, 10#, 70#, 5#, 5#, 5#, 15#, 10#, 10#)
+
+    Set tbl = ftr.Range.Tables.Add(Range:=rng, NumRows:=8, NumColumns:=12)
+
+    ConfigureLinearFooterTable tbl, 185#
+
+    For c = 1 To 12
+        tbl.Columns(c).PreferredWidthType = wdPreferredWidthPoints
+        tbl.Columns(c).Width = ptFromMm(CDbl(colWidthsMm(c - 1)))
+    Next c
+
+    For r = 1 To 8
+        With tbl.Rows(r)
+            .HeightRule = wdRowHeightExactly
+            .Height = ptFromMm(5#) ' 8 строк по 5 мм = 40 мм
+            .AllowBreakAcrossPages = False
+        End With
+        For c = 1 To 12
+            FormatStampCell tbl.Cell(r, c), 8, wdAlignParagraphCenter
+        Next c
+    Next r
+
+    ApplyBaseStampBorders tbl
+
+    ' 1. Тонкие горизонтальные линии в левом блоке ДО слияния ячеек:
+    For r = 1 To 2
+        For c = 1 To 5
+            FormatSingleBorder tbl.Cell(r, c).Borders(wdBorderBottom), STAMP_LINE_THIN
+        Next c
+    Next r
+    For r = 4 To 7
+        For c = 1 To 5
+            FormatSingleBorder tbl.Cell(r, c).Borders(wdBorderBottom), STAMP_LINE_THIN
+        Next c
+    Next r
+
+    ' 2. Заполнение всех надписей и полей Формы 2 по сетке 8x12 ДО слияния ячеек:
+    SetCellText tbl.Cell(3, 1), "Изм.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 2), "Лист", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 3), "№ докум.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 4), "Подп.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 5), "Дата", 7.5, wdAlignParagraphCenter
+
+    SetCellTextWithLeftIndent tbl.Cell(4, 1), "Разраб.", 8
+    SetCellTextWithLeftIndent tbl.Cell(4, 3), devSurname, 8
+
+    SetCellTextWithLeftIndent tbl.Cell(5, 1), "Пров.", 8
+    SetCellTextWithLeftIndent tbl.Cell(5, 3), checkerSurname, 8
+
+    SetCellTextWithLeftIndent tbl.Cell(7, 1), "Н. контр.", 8
+    SetCellTextWithLeftIndent tbl.Cell(7, 3), normSurname, 8
+
+    SetCellTextWithLeftIndent tbl.Cell(8, 1), "Утв.", 8
+    SetCellTextWithLeftIndent tbl.Cell(8, 3), approverSurname, 8
+
+    ' Правая часть Формы 2:
+    SetCellText tbl.Cell(1, 6), docCode, 12, wdAlignParagraphCenter
+
+
+    SetCellText tbl.Cell(4, 6), docTitle, 10, wdAlignParagraphCenter
+
+    SetCellText tbl.Cell(4, 7), "Лит.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(4, 10), "Лист", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(4, 11), "Листов", 7.5, wdAlignParagraphCenter
+
+    InsertFieldInCell tbl.Cell(5, 10), wdFieldPage, 9
+    InsertFieldInCell tbl.Cell(5, 11), wdFieldNumPages, 9
+
+    SetCellText tbl.Cell(6, 7), orgName, 9, wdAlignParagraphCenter
+
+    ' 3. Объединение ячеек снизу вверх и справа налево:
+    tbl.Cell(6, 7).Merge MergeTo:=tbl.Cell(8, 12)
+    tbl.Cell(5, 11).Merge MergeTo:=tbl.Cell(5, 12)
+    tbl.Cell(4, 11).Merge MergeTo:=tbl.Cell(4, 12)
+    tbl.Cell(4, 7).Merge MergeTo:=tbl.Cell(4, 9)
+    tbl.Cell(4, 6).Merge MergeTo:=tbl.Cell(8, 6)
+    tbl.Cell(1, 6).Merge MergeTo:=tbl.Cell(3, 12)
+
+    For r = 8 To 4 Step -1
+        tbl.Cell(r, 1).Merge MergeTo:=tbl.Cell(r, 2)
+    Next r
+
+    SuppressTrailingHeaderFooterParagraph ftr
+End Sub
+
+' ==============================================================================
+' Линейная таблица Формы 2а (185 x 15 мм) в нижнем колонтитуле последующих листов
+' ==============================================================================
+Private Sub BuildFooterTableForm2a(ByVal ftr As HeaderFooter, ByVal docCode As String)
+    Dim rng As Range
+    Dim tbl As Table
+    Dim r As Long, c As Long
+    Dim colWidthsMm As Variant
+
+    Set rng = ftr.Range
+    rng.Collapse wdCollapseStart
+
+    ' 8 базовых столбцов: 7, 10, 23, 15, 10, 100, 10, 10 мм (сумма = 185 мм)
+    colWidthsMm = Array(7#, 10#, 23#, 15#, 10#, 100#, 10#, 10#)
+
+    Set tbl = ftr.Range.Tables.Add(Range:=rng, NumRows:=3, NumColumns:=8)
+
+    ConfigureLinearFooterTable tbl, 185#
+
+    For c = 1 To 8
+        tbl.Columns(c).PreferredWidthType = wdPreferredWidthPoints
+        tbl.Columns(c).Width = ptFromMm(CDbl(colWidthsMm(c - 1)))
+    Next c
+
+    For r = 1 To 3
+        With tbl.Rows(r)
+            .HeightRule = wdRowHeightExactly
+            .Height = ptFromMm(5#) ' 3 строки по 5 мм = 15 мм
+            .AllowBreakAcrossPages = False
+        End With
+        For c = 1 To 8
+            FormatStampCell tbl.Cell(r, c), 8, wdAlignParagraphCenter
+        Next c
+    Next r
+
+    ApplyBaseStampBorders tbl
+
+    ' 1. Тонкие горизонтальные линии для строк изменений (строки 1 и 2 в столбцах 1..5):
+    For r = 1 To 2
+        For c = 1 To 5
+            FormatSingleBorder tbl.Cell(r, c).Borders(wdBorderBottom), STAMP_LINE_THIN
+        Next c
+    Next r
+
+    ' 2. Заполнение текста и поля PAGE по сетке 3x8 ДО слияния:
+    SetCellText tbl.Cell(3, 1), "Изм.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 2), "Лист", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 3), "№ докум.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 4), "Подп.", 7.5, wdAlignParagraphCenter
+    SetCellText tbl.Cell(3, 5), "Дата", 7.5, wdAlignParagraphCenter
+
+    SetCellText tbl.Cell(1, 6), docCode, 12, wdAlignParagraphCenter
+
+    SetCellText tbl.Cell(1, 8), "Лист", 7.5, wdAlignParagraphCenter
+
+    InsertFieldInCell tbl.Cell(2, 8), wdFieldPage, 10
+
+    ' 3. Объединение ячеек справа налево:
+    tbl.Cell(2, 8).Merge MergeTo:=tbl.Cell(3, 8)
+    tbl.Cell(1, 6).Merge MergeTo:=tbl.Cell(3, 7)
+
+    SuppressTrailingHeaderFooterParagraph ftr
+End Sub
+
+Private Sub ConfigureLinearFooterTable(ByVal tbl As Table, ByVal totalWidthMm As Double)
+    With tbl
+        .TopPadding = 0
+        .BottomPadding = 0
+        .LeftPadding = 0
+        .RightPadding = 0
+        .Spacing = 0
+        .AllowAutoFit = False
+        .PreferredWidthType = wdPreferredWidthPoints
+        .PreferredWidth = ptFromMm(totalWidthMm)
+        With .Rows
+            .WrapAroundText = False ' ЛИНЕЙНАЯ таблица в колонтитуле — не выталкивает текст со страницы!
+            .Alignment = wdAlignRowLeft
+            .LeftIndent = -ptFromMm(5#) ' Сдвиг на -5 мм от левого поля 25 мм -> ровно 20 мм от края листа!
+        End With
+    End With
+End Sub
+
+' ==============================================================================
+' Вспомогательные процедуры
+' ==============================================================================
+Private Function ptFromMm(ByVal mm As Double) As Single
+    ptFromMm = CentimetersToPoints(mm / 10#)
+End Function
+
+Private Sub SetCellTextWithLeftIndent(ByVal cl As Cell, ByVal textVal As String, ByVal fontSizePt As Single)
+    SetCellText cl, textVal, fontSizePt, wdAlignParagraphLeft
+    cl.Range.ParagraphFormat.LeftIndent = ptFromMm(1#)
+End Sub
+
+Private Sub FormatStampCell(ByVal cl As Cell, ByVal fontSizePt As Single, ByVal align As WdParagraphAlignment)
+    cl.VerticalAlignment = wdCellAlignVerticalCenter
+    With cl.Range
+        .Font.Name = "Times New Roman"
+        .Font.Size = fontSizePt
+        .Font.Bold = False
+        .Font.Italic = True
+        .ParagraphFormat.Alignment = align
+        .ParagraphFormat.FirstLineIndent = 0
+        .ParagraphFormat.LeftIndent = 0
+        .ParagraphFormat.RightIndent = 0
+        .ParagraphFormat.SpaceBefore = 0
+        .ParagraphFormat.SpaceAfter = 0
+        .ParagraphFormat.LineSpacingRule = wdLineSpaceSingle
+    End With
+End Sub
+
+Private Sub SetCellText(ByVal cl As Cell, ByVal textVal As String, _
+                        ByVal fontSizePt As Single, ByVal align As WdParagraphAlignment)
+    Dim rng As Range
+    Set rng = cl.Range
+    rng.End = rng.End - 1
+    rng.Text = textVal
+    FormatStampCell cl, fontSizePt, align
+End Sub
+
+Private Sub InsertFieldInCell(ByVal cl As Cell, ByVal fieldType As WdFieldType, ByVal fontSizePt As Single)
+    Dim rng As Range
+    FormatStampCell cl, fontSizePt, wdAlignParagraphCenter
+    Set rng = cl.Range
+    rng.End = rng.End - 1
+    rng.Text = ""
+    rng.Collapse wdCollapseStart
+    cl.Range.Fields.Add Range:=rng, Type:=fieldType, PreserveFormatting:=False
+    FormatStampCell cl, fontSizePt, wdAlignParagraphCenter
+End Sub
+
+Private Sub ApplyBaseStampBorders(ByVal tbl As Table)
+    ' Верх штампа — основная линия (STAMP_LINE_MAIN = 2,25 пт).
+    ' Левая, правая и нижняя линии контура совпадают с рамкой листа (фигура 2,5 пт),
+    ' поэтому границами таблицы не дублируются (иначе линии «выпирают»).
+    FormatSingleBorder tbl.Borders(wdBorderTop), STAMP_LINE_MAIN
+    ClearBorder tbl.Borders(wdBorderLeft)
+    ClearBorder tbl.Borders(wdBorderRight)
+    ClearBorder tbl.Borders(wdBorderBottom)
+
+    ' Внутренняя сетка штампа — тонкая линия (STAMP_LINE_THIN = 1 пт)
+    FormatSingleBorder tbl.Borders(wdBorderHorizontal), STAMP_LINE_THIN
+    FormatSingleBorder tbl.Borders(wdBorderVertical), STAMP_LINE_THIN
+End Sub
+
+Private Sub ClearBorder(ByVal brd As Border)
+    brd.LineStyle = wdLineStyleNone
+End Sub
+
+' Толщина границы: допускаются только значения перечисления WdLineWidth.
+' Ошибки НЕ скрываются: недопустимое значение или сбой Word доходят до обработчика
+' CleanFail в BuildGOSTDocument с указанием этапа.
+Private Sub FormatSingleBorder(ByVal brd As Border, ByVal weight As WdLineWidth)
+    Select Case weight
+        Case wdLineWidth025pt, wdLineWidth050pt, wdLineWidth075pt, wdLineWidth100pt, _
+             wdLineWidth150pt, wdLineWidth225pt, wdLineWidth300pt, wdLineWidth450pt, wdLineWidth600pt
+            ' допустимо
+        Case Else
+            Err.Raise vbObjectError + 1001, "FormatSingleBorder", _
+                      "Недопустимое значение WdLineWidth: " & CStr(weight)
+    End Select
+    With brd
+        .LineStyle = wdLineStyleSingle
+        .LineWidth = weight
+        .Color = wdColorBlack
+    End With
+End Sub
+
+Private Sub SuppressTrailingHeaderFooterParagraph(ByVal hf As HeaderFooter)
+    On Error Resume Next
+    Dim lastPara As Paragraph
+    Set lastPara = hf.Range.Paragraphs.Last
+    If Not lastPara Is Nothing Then
+        With lastPara.Range
+            .Font.Size = 1
+            .ParagraphFormat.SpaceBefore = 0
+            .ParagraphFormat.SpaceAfter = 0
+            .ParagraphFormat.LineSpacingRule = wdLineSpaceExactly
+            .ParagraphFormat.LineSpacing = 1
+        End With
+    End If
+    On Error GoTo 0
+End Sub
+
+Private Sub UpdateAllDocumentFields(ByVal doc As Document)
+    Dim sec As Section
+    Dim toc As TableOfContents
+
+    On Error Resume Next
+    doc.Repaginate
+    doc.Fields.Update
+
+    For Each sec In doc.Sections
+        sec.Headers(wdHeaderFooterFirstPage).Range.Fields.Update
+        sec.Headers(wdHeaderFooterPrimary).Range.Fields.Update
+        sec.Footers(wdHeaderFooterFirstPage).Range.Fields.Update
+        sec.Footers(wdHeaderFooterPrimary).Range.Fields.Update
+    Next sec
+
+    For Each toc In doc.TablesOfContents
+        toc.Update
+    Next toc
+    On Error GoTo 0
+End Sub
+
+
+
